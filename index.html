@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Tilt Physics · WebGPU</title>
+<style>
+:root{color-scheme:dark;--bg:#05070d;--fg:#d7e3ff;--mut:#8696ba;--acc:#6ea8ff;--panel:rgba(12,18,32,.72)}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;overflow:hidden;overscroll-behavior:none;touch-action:none;user-select:none;-webkit-user-select:none}
+canvas{position:fixed;inset:0;width:100%;height:100%;display:block}
+#msg{position:fixed;left:50%;bottom:calc(env(safe-area-inset-bottom,0px) + 18px);transform:translateX(-50%);max-width:calc(100% - 32px);padding:8px 14px;border-radius:10px;background:rgba(12,18,32,.85);color:var(--fg);font-size:13px;text-align:center;pointer-events:none}
+#msg[hidden]{display:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="msg" hidden></div>
+
+<script>
+const D=Math.PI/180, MAX=12000, GX=64, GY=32, GZ=12, CELLS=GX*GY*GZ, SL=8, SUB=5, CD=4.2, HZ=0.5, R0=0.045;
+const $=id=>document.getElementById(id), cv=$('c');
+
+/* ---------------- sensor fusion ---------------- */
+const S={up:[0,1,0],upT:[0,1,0],gl:[0,9.81,0],lin:[0,0,0],linS:[0,0,0],omega:[0,0,0],alpha:[0,0,0],wt:0,
+  ori:false,motion:false,gyro:false,gLin:false,gGyro:false,gGrav:false,flip:1,dot:0,ptr:[0,0],gain:4.5};
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+
+// device axes -> screen axes (handles landscape)
+function scr(v){
+  const a=(((screen.orientation&&screen.orientation.angle)??window.orientation??0)+360)%360,[x,y,z]=v;
+  return a===90?[-y,x,z]:a===180?[-x,-y,z]:a===270?[y,-x,z]:v;
+}
+function setOmega(x,y,z,t){
+  const w=[x,y,z],dt=(t-S.wt)/1000;
+  if(dt>0.001&&dt<0.2)for(let i=0;i<3;i++)S.alpha[i]+=(clamp((w[i]-S.omega[i])/dt,-80,80)-S.alpha[i])*0.2;
+  S.omega=w;S.wt=t;
+}
+function onOrientation(e){
+  if(e.beta==null||e.gamma==null)return;
+  S.ori=true;const b=e.beta*D,g=e.gamma*D;
+  // world "up" expressed in device axes, from the OS-fused gyro/accel orientation
+  S.upT=[-Math.cos(b)*Math.sin(g),Math.sin(b),Math.cos(b)*Math.cos(g)];
+}
+function onMotion(e){
+  const ig=e.accelerationIncludingGravity,ac=e.acceleration,rr=e.rotationRate,now=performance.now();
+  if(ig&&ig.x!=null){
+    S.motion=true;
+    // auto-detect axis sign convention (iOS and Android differ) by comparing with orientation gravity
+    const d=(ig.x*S.up[0]+ig.y*S.up[1]+ig.z*S.up[2])/9.81;
+    if(S.ori){S.dot+=(d-S.dot)*0.02;if(Math.abs(S.dot)>0.4)S.flip=Math.sign(S.dot);}
+    const f=S.flip,igv=[ig.x*f,ig.y*f,ig.z*f];
+    if(!S.gGrav)for(let i=0;i<3;i++)S.gl[i]+=(igv[i]-S.gl[i])*0.08;
+    if(!S.gLin){
+      const l=Math.hypot(...S.up)||1;
+      const lin=(ac&&ac.x!=null)?[ac.x*f,ac.y*f,ac.z*f]:S.ori?igv.map((v,i)=>v-S.up[i]/l*9.81):[0,0,0];
+      S.lin=lin.map(v=>clamp(v,-80,80));
+    }
+  }
+  if(rr&&rr.alpha!=null&&!S.gGyro){S.gyro=true;setOmega(rr.beta*D,rr.gamma*D,rr.alpha*D,now);}
+}
+function genericSensors(){ // Chrome/Android Generic Sensor API: higher-rate, OS-fused streams
+  const mk=(n,cb)=>{S.ge=S.ge||[];try{if(!(n in window))return S.ge.push(n+' missing');const s=new window[n]({frequency:60,referenceFrame:'device'});s.onreading=()=>cb(s);s.onerror=e=>S.ge.push(n+' '+(e.error&&e.error.name));s.start();}catch(e){S.ge.push(n+' '+e.name);}};
+  mk('LinearAccelerationSensor',s=>{S.gLin=true;S.lin=[clamp(s.x,-80,80),clamp(s.y,-80,80),clamp(s.z,-80,80)];});
+  mk('GravitySensor',s=>{S.gGrav=true;S.gl=[s.x,s.y,s.z];});
+  mk('Gyroscope',s=>{S.gGyro=true;S.gyro=true;setOmega(s.x,s.y,s.z,performance.now());});
+}
+// returns effective gravity (gravity minus box acceleration) + rotating-frame terms, in screen axes
+function sense(){
+  if(!S.motion&&!S.ori){
+    const p=S.ptr,v=[p[0]*1.6,-1+p[1]*1.2,0],l=Math.hypot(...v)||1;
+    return {g:v.map(x=>x/l*9.81),w:[0,0,0],a:[0,0,0]};
+  }
+  for(let i=0;i<3;i++){S.up[i]+=(S.upT[i]-S.up[i])*0.4;S.linS[i]+=(S.lin[i]-S.linS[i])*0.9;}
+  const l=Math.hypot(...S.up)||1;
+  const base=S.gGrav?S.gl:S.ori?S.up.map(x=>x/l*9.81):S.gl;
+  return {g:scr(base.map((x,i)=>-(x+S.linS[i]*S.gain))),w:scr(S.omega),a:scr(S.alpha)};
+}
+
+/* ---------------- WGSL ---------------- */
+const CS=/* wgsl */`
+struct P{pos:vec4<f32>,vel:vec4<f32>};
+struct Sim{half:vec4<f32>,grav:vec4<f32>,omega:vec4<f32>,alpha:vec4<f32>,misc:vec4<f32>};
+@group(0) @binding(0) var<uniform> S:Sim;
+@group(0) @binding(1) var<storage,read> src:array<P>;
+@group(0) @binding(2) var<storage,read_write> dst:array<P>;
+@group(0) @binding(3) var<storage,read_write> cnt:array<atomic<u32>>;
+@group(0) @binding(4) var<storage,read_write> slots:array<u32>;
+const GX=${GX};const GY=${GY};const GZ=${GZ};const SL=${SL}u;
+fn cellOf(x:vec3<f32>)->vec3<i32>{
+  let q=vec3<i32>(floor((x+S.half.xyz)/S.misc.y));
+  return clamp(q,vec3<i32>(0),vec3<i32>(GX-1,GY-1,GZ-1));
+}
+fn cid(q:vec3<i32>)->u32{return u32(q.x+GX*(q.y+GY*q.z));}
+
+@compute @workgroup_size(64) fn clear(@builtin(global_invocation_id) g:vec3<u32>){
+  if(g.x<u32(GX*GY*GZ)){atomicStore(&cnt[g.x],0u);}
+}
+@compute @workgroup_size(64) fn bin(@builtin(global_invocation_id) g:vec3<u32>){
+  let i=g.x; if(i>=u32(S.misc.x)){return;}
+  let c=cid(cellOf(src[i].pos.xyz));
+  let s=atomicAdd(&cnt[c],1u);
+  if(s<SL){slots[c*SL+s]=i;}
+}
+@compute @workgroup_size(64) fn step(@builtin(global_invocation_id) g:vec3<u32>){
+  let i=g.x; if(i>=u32(S.misc.x)){return;}
+  let p=src[i]; let r=p.pos.w; let dt=S.half.w;
+  var x=p.pos.xyz; var v=p.vel.xyz;
+  let w=S.omega.xyz;
+  // effective gravity (incl. phone linear accel) + centrifugal, Coriolis, Euler forces from gyro
+  var a=S.grav.xyz-cross(w,cross(w,x))-2.0*cross(w,v)-cross(S.alpha.xyz,x);
+  let c=cellOf(x);
+  for(var dz=-1;dz<=1;dz++){for(var dy=-1;dy<=1;dy++){for(var dx=-1;dx<=1;dx++){
+    let q=c+vec3<i32>(dx,dy,dz);
+    if(q.x<0||q.y<0||q.z<0||q.x>=GX||q.y>=GY||q.z>=GZ){continue;}
+    let ci=cid(q); let m=min(atomicLoad(&cnt[ci]),SL);
+    for(var k=0u;k<m;k++){
+      let j=slots[ci*SL+k]; if(j==i){continue;}
+      let o=src[j]; let d=x-o.pos.xyz; let rr=r+o.pos.w; let d2=dot(d,d);
+      if(d2<rr*rr&&d2>1e-9){
+        let dist=sqrt(d2); let n=d/dist; let rv=v-o.vel.xyz; let vn=dot(rv,n);
+        a+=n*max(24000.0*(rr-dist)-80.0*vn,0.0)-(rv-n*vn)*2.0; // spring-damper + friction
+      }
+    }
+  }}}
+  let al=length(a); if(al>4000.0){a*=4000.0/al;}
+  v+=a*dt; v*=1.0-0.25*dt;
+  let sp=length(v); if(sp>12.0){v*=12.0/sp;}
+  x+=v*dt;
+  let lim=S.half.xyz-vec3<f32>(r);
+  if(x.x>lim.x){x.x=lim.x;v.x=-abs(v.x)*0.55;} if(x.x<-lim.x){x.x=-lim.x;v.x=abs(v.x)*0.55;}
+  if(x.y>lim.y){x.y=lim.y;v.y=-abs(v.y)*0.55;} if(x.y<-lim.y){x.y=-lim.y;v.y=abs(v.y)*0.55;}
+  if(x.z>lim.z){x.z=lim.z;v.z=-abs(v.z)*0.55;} if(x.z<-lim.z){x.z=-lim.z;v.z=abs(v.z)*0.55;}
+  dst[i]=P(vec4<f32>(x,r),vec4<f32>(v,0.0));
+}`;
+
+const RS=/* wgsl */`
+struct P{pos:vec4<f32>,vel:vec4<f32>};
+struct U{proj:mat4x4<f32>,half:vec4<f32>,misc:vec4<f32>};
+@group(0) @binding(0) var<uniform> u:U;
+@group(0) @binding(1) var<storage,read> ps:array<P>;
+struct VO{@builtin(position) pos:vec4<f32>,@location(0) uv:vec2<f32>,@location(1) col:vec3<f32>,@location(2) c:vec3<f32>,@location(3) r:f32};
+@vertex fn vs(@builtin(vertex_index) vi:u32,@builtin(instance_index) ii:u32)->VO{
+  var q=array<vec2<f32>,6>(vec2(-1.0,-1.0),vec2(1.0,-1.0),vec2(-1.0,1.0),vec2(-1.0,1.0),vec2(1.0,-1.0),vec2(1.0,1.0));
+  let p=ps[ii]; let c=p.pos.xyz-vec3<f32>(0.0,0.0,u.misc.x); let uv=q[vi];
+  var o:VO;
+  o.pos=u.proj*vec4<f32>(c+vec3<f32>(uv*p.pos.w,0.0),1.0);
+  o.uv=uv; o.c=c; o.r=p.pos.w;
+  var pal=array<vec3<f32>,5>(vec3<f32>(0.9961,0.8078,0.0392),vec3<f32>(0.9686,0.5882,0.2431),vec3<f32>(0.7961,0.1882,0.1961),vec3<f32>(0.1765,0.5961,0.3137),vec3<f32>(0.1451,0.2118,0.4549));
+  let h=fract(sin(f32(ii)*12.9898)*43758.5453);
+  o.col=pal[min(u32(h*5.0),4u)];
+  return o;
+}
+struct FO{@builtin(frag_depth) d:f32,@location(0) c:vec4<f32>};
+@fragment fn fs(i:VO)->FO{
+  let d2=dot(i.uv,i.uv); if(d2>1.0){discard;}
+  let n=vec3<f32>(i.uv,sqrt(1.0-d2));
+  let cl=u.proj*vec4<f32>(i.c+n*i.r,1.0);
+  let L=normalize(vec3<f32>(-0.4,0.6,0.7));
+  let diff=max(dot(n,L),0.0);
+  let H=normalize(L+vec3<f32>(0.0,0.0,1.0));
+  let spec=pow(max(dot(n,H),0.0),48.0);
+  let rim=pow(1.0-n.z,3.0)*0.25;
+  return FO(cl.z/cl.w,vec4<f32>(i.col*(0.2+0.9*diff)+spec*0.25+rim*vec3<f32>(0.5,0.7,1.0),1.0));
+}
+`;
+
+/* ---------------- main ---------------- */
+let N=0,cur=0,device,bufs,bgs,rbgs,rU,simU,depth,aspect=0,eff={g:[0,-9.81,0]};
+// the box is exactly the visible screen (orthographic view), so balls reach every screen edge
+const dims=()=>{const a=cv.width/cv.height,hy=Math.min(1.6,3.4/a);return[hy*a,hy,HZ];};
+function ortho(hx,hy){
+  const n=0.1,f=20;
+  return[1/hx,0,0,0, 0,1/hy,0,0, 0,0,1/(n-f),0, 0,0,n/(n-f),1];
+}
+function msg(t,ms){
+  const m=$('msg');m.textContent=t;m.hidden=false;clearTimeout(msg.t);
+  if(ms)msg.t=setTimeout(()=>{m.hidden=true;},ms);
+}
+
+function reset(){
+  const[hx,hy,hz]=dims(),s=0.1,nx=Math.max(1,Math.floor(2*hx/s)),nz=Math.max(1,Math.floor(2*hz/s)),ly=Math.max(1,Math.floor(2*hy/s));
+  N=Math.min(4000,nx*nz*ly);
+  const d=new Float32Array(MAX*8),j=()=>(Math.random()-0.5)*0.01;
+  for(let k=0;k<MAX;k++){
+    const r=R0*(0.8+0.4*Math.random()),ix=k%nx,iz=Math.floor(k/nx)%nz,iy=Math.floor(k/(nx*nz))%ly;
+    d.set([-hx+s*(ix+0.5)+j(),hy-r-iy*s,-hz+s*(iz+0.5)+j(),r],k*8);
+  }
+  bufs.forEach(b=>device.queue.writeBuffer(b,0,d));cur=0;aspect=cv.width/cv.height;
+}
+
+async function main(){
+  if(!navigator.gpu){msg('WebGPU is not supported on this device.');return;}
+  const ad=await navigator.gpu.requestAdapter();
+  if(!ad){msg('WebGPU is not supported on this device.');return;}
+  device=await ad.requestDevice();
+  const ctx=cv.getContext('webgpu'),fmt=navigator.gpu.getPreferredCanvasFormat();
+  ctx.configure({device,format:fmt,alphaMode:'opaque'});
+
+  const U=GPUBufferUsage,C=GPUShaderStage.COMPUTE;
+  simU=device.createBuffer({size:80,usage:U.UNIFORM|U.COPY_DST});
+  rU=device.createBuffer({size:96,usage:U.UNIFORM|U.COPY_DST});
+  bufs=[0,1].map(()=>device.createBuffer({size:MAX*32,usage:U.STORAGE|U.COPY_DST}));
+  const cnt=device.createBuffer({size:CELLS*4,usage:U.STORAGE}),slots=device.createBuffer({size:CELLS*SL*4,usage:U.STORAGE});
+
+  const bgl=device.createBindGroupLayout({entries:[
+    {binding:0,visibility:C,buffer:{type:'uniform'}},
+    {binding:1,visibility:C,buffer:{type:'read-only-storage'}},
+    {binding:2,visibility:C,buffer:{type:'storage'}},
+    {binding:3,visibility:C,buffer:{type:'storage'}},
+    {binding:4,visibility:C,buffer:{type:'storage'}}]});
+  const pl=device.createPipelineLayout({bindGroupLayouts:[bgl]}),cm=device.createShaderModule({code:CS});
+  const mk=e=>device.createComputePipeline({layout:pl,compute:{module:cm,entryPoint:e}});
+  const pClear=mk('clear'),pBin=mk('bin'),pStep=mk('step');
+  bgs=[0,1].map(i=>device.createBindGroup({layout:bgl,entries:[
+    {binding:0,resource:{buffer:simU}},{binding:1,resource:{buffer:bufs[i]}},{binding:2,resource:{buffer:bufs[1-i]}},
+    {binding:3,resource:{buffer:cnt}},{binding:4,resource:{buffer:slots}}]}));
+
+  const rm=device.createShaderModule({code:RS}),ds={format:'depth32float',depthWriteEnabled:true,depthCompare:'less'};
+  const sphereP=device.createRenderPipeline({layout:'auto',vertex:{module:rm,entryPoint:'vs'},
+    fragment:{module:rm,entryPoint:'fs',targets:[{format:fmt}]},primitive:{topology:'triangle-list'},depthStencil:ds});
+  rbgs=[0,1].map(i=>device.createBindGroup({layout:sphereP.getBindGroupLayout(0),entries:[
+    {binding:0,resource:{buffer:rU}},{binding:1,resource:{buffer:bufs[i]}}]}));
+
+  function resize(){
+    const dpr=Math.min(devicePixelRatio||1,2),w=Math.max(1,Math.round(cv.clientWidth*dpr)),h=Math.max(1,Math.round(cv.clientHeight*dpr));
+    if(w===cv.width&&h===cv.height&&depth)return;
+    cv.width=w;cv.height=h;if(depth)depth.destroy();
+    depth=device.createTexture({size:[w,h],format:'depth32float',usage:GPUTextureUsage.RENDER_ATTACHMENT});
+    // re-fill the box only on a real shape change (rotation), not when browser toolbars slide
+    if(aspect&&Math.abs(w/h/aspect-1)>0.15)reset();
+  }
+  resize();reset();
+
+  let last=performance.now();
+  function frame(t){
+    const raw=(t-last)/1000||0.016;last=t;
+    const dt=Math.min(raw,1/30)/SUB;
+    resize();
+    const[hx,hy,hz]=dims();eff=sense();
+    device.queue.writeBuffer(simU,0,new Float32Array([hx,hy,hz,dt,...eff.g,0,...eff.w,0,...eff.a,0,N,0.11,0,0]));
+    device.queue.writeBuffer(rU,0,new Float32Array([...ortho(hx,hy),hx,hy,hz,0,CD,0,0,0]));
+
+    const enc=device.createCommandEncoder(),cp=enc.beginComputePass(),wg=Math.ceil(N/64);
+    for(let s=0;s<SUB;s++){
+      cp.setBindGroup(0,bgs[cur]);
+      cp.setPipeline(pClear);cp.dispatchWorkgroups(Math.ceil(CELLS/64));
+      cp.setPipeline(pBin);cp.dispatchWorkgroups(wg);
+      cp.setPipeline(pStep);cp.dispatchWorkgroups(wg);
+      cur^=1;
+    }
+    cp.end();
+    const rp=enc.beginRenderPass({
+      colorAttachments:[{view:ctx.getCurrentTexture().createView(),clearValue:{r:0.02,g:0.03,b:0.06,a:1},loadOp:'clear',storeOp:'store'}],
+      depthStencilAttachment:{view:depth.createView(),depthClearValue:1,depthLoadOp:'clear',depthStoreOp:'store'}});
+    rp.setPipeline(sphereP);rp.setBindGroup(0,rbgs[cur]);rp.draw(6,N);
+    rp.end();
+    device.queue.submit([enc.finish()]);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+}
+
+/* ---------------- sensors: no UI, starts on its own (iPhone needs one tap anywhere) ---------------- */
+const ptr=e=>{if(!S.motion&&!S.ori)S.ptr=[(e.clientX/innerWidth)*2-1,1-(e.clientY/innerHeight)*2];};
+addEventListener('pointermove',ptr);addEventListener('pointerdown',ptr);
+
+let started=false;
+function startSensors(){
+  if(started)return;started=true;
+  const DM=window.DeviceMotionEvent,DO=window.DeviceOrientationEvent;
+  const ask=async C=>{
+    if(!C||typeof C.requestPermission!=='function')return 'n/a';
+    try{return await C.requestPermission();}catch(e){return 'error';}
+  };
+  // both requests start synchronously inside the gesture so neither loses it
+  const reqs=Promise.all([ask(DM),ask(DO)]);
+  addEventListener('deviceorientation',onOrientation);
+  addEventListener('devicemotion',onMotion);
+  genericSensors();
+  reqs.then(r=>setTimeout(()=>{
+    if(S.motion||S.ori)return;
+    msg(r.includes('denied')||r.includes('error')?'Motion access was denied.':'No motion sensors found. Drag to tilt.',5000);
+  },1500));
+}
+const needsTap=['DeviceMotionEvent','DeviceOrientationEvent'].some(k=>window[k]&&typeof window[k].requestPermission==='function');
+if(needsTap){
+  const once=()=>{removeEventListener('click',once);removeEventListener('touchend',once);startSensors();};
+  addEventListener('click',once);addEventListener('touchend',once);
+}else startSensors();
+
+main().catch(e=>{console.error(e);msg('WebGPU failed to start.');});
+</script>
+</body>
+</html>
